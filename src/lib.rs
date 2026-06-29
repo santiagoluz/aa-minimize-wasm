@@ -10,28 +10,36 @@ use std::time::Instant;
 
 // Steering wheel button to intercept (set to your car's keycode)
 const KEYCODE_TRIGGER: u32 = 65540;
-// Key name to inject on long press — must match the proto enum name.
-// "KEYCODE_HOME" minimizes Android Auto back to the phone home screen.
-const KEYCODE_HOME_NAME: &str = "KEYCODE_HOME";
 // INPUT_MESSAGE_INPUT_REPORT message ID
 const MSG_INPUT_REPORT: u16 = 0x8001;
+// MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION message ID
+const MSG_VIDEO_FOCUS_NOTIFICATION: u16 = 0x8008;
 // Minimum hold duration to classify as a long press
 const LONG_PRESS_MS: u128 = 500;
+
+// VideoFocusNotification { focus: VIDEO_FOCUS_NATIVE=2, unsolicited: true }
+// payload[0..2] = message_id 0x8008 (aa-proxy-rs convention: msg_id lives in payload)
+// payload[2..] = proto: field1(focus)=varint(2), field2(unsolicited)=varint(1)
+const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 6] = [0x80, 0x08, 0x08, 0x02, 0x10, 0x01];
+
+// ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST — used by aa-proxy-rs for all
+// injected single-frame packets.
+const PKT_FLAGS_SINGLE: u8 = 0x0B;
 
 // State machine for tracking a single button's press/release lifecycle.
 // WASM is single-threaded, so Cell<_> is safe here.
 #[derive(Copy, Clone)]
 enum PressState {
-    // No press in progress.
     Idle,
-    // Button is held down since this instant.
     Pressed(Instant),
-    // We acted on this press; waiting to absorb the proxy's duplicate up-event.
     Handled,
 }
 
 thread_local! {
     static STATE: Cell<PressState> = Cell::new(PressState::Idle);
+    // Video channel learned from the first VIDEO_FOCUS_NOTIFICATION seen in
+    // the session. Defaults to 0x11, which is the typical value.
+    static VIDEO_CH: Cell<u8> = Cell::new(0x11);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +139,10 @@ struct Component;
 
 impl Guest for Component {
     fn on_create() {
-        aa::packet::host::info(&format!("[aa-minimize] loaded: long-press keycode {} → {}", KEYCODE_TRIGGER, KEYCODE_HOME_NAME));
+        aa::packet::host::info(&format!(
+            "[aa-minimize] loaded: long-press keycode {} → VIDEO_FOCUS_NATIVE",
+            KEYCODE_TRIGGER
+        ));
     }
 
     fn on_destroy() {}
@@ -143,9 +154,16 @@ impl Guest for Component {
     fn on_config_changed(_name: String, _value: String) {}
 
     fn modify_packet(_ctx: ModifyContext, pkt: Packet, _cfg: ConfigView) -> Decision {
+        // Sniff VIDEO_FOCUS_NOTIFICATION to learn which channel the video stream
+        // uses this session. The first one always arrives at AA connect time
+        // (focus: VIDEO_FOCUS_PROJECTED) so VIDEO_CH is set before it's needed.
+        if pkt.proxy_type == ProxyType::MobileDevice
+            && pkt.message_id == MSG_VIDEO_FOCUS_NOTIFICATION
+        {
+            VIDEO_CH.with(|c| c.set(pkt.channel));
+        }
+
         // ── Debug: log every key event with its direction ───────────────────
-        // This surfaces information that aa-proxy-rs does not log itself:
-        // which side of the proxy each key event originates from.
         if pkt.message_id == MSG_INPUT_REPORT && pkt.payload.len() >= 2 {
             if let Some((keycode, down)) = parse_key(&pkt.payload[2..]) {
                 let dir = match pkt.proxy_type {
@@ -205,17 +223,23 @@ impl Guest for Component {
                     s.set(PressState::Handled);
 
                     if elapsed_ms >= LONG_PRESS_MS {
+                        let ch = VIDEO_CH.with(|c| c.get());
                         aa::packet::host::info(&format!(
-                            "[aa-minimize] long press {}ms → {}",
-                            elapsed_ms, KEYCODE_HOME_NAME
+                            "[aa-minimize] long press {}ms → VIDEO_FOCUS_NATIVE on ch {:#04x}",
+                            elapsed_ms, ch
                         ));
-                        // /inject_event is whitelisted for WASM scripts; /input/key is not.
-                        // It takes the proto enum name ("KEYCODE_HOME"), not a numeric id.
-                        aa::packet::host::rest_call(
-                            "POST",
-                            "/inject_event",
-                            &format!(r#"{{"keycode":"{}"}}"#, KEYCODE_HOME_NAME),
-                        );
+                        // Inject VideoFocusNotification { focus: NATIVE, unsolicited: true }
+                        // directly into the media_sink channel. This is what the phone's AA
+                        // app sends when the user taps the exit/vehicle-logo button — it
+                        // causes the HU to release AA and return to the native screen.
+                        aa::packet::host::send(&Packet {
+                            proxy_type: ProxyType::MobileDevice,
+                            channel: ch,
+                            packet_flags: PKT_FLAGS_SINGLE,
+                            final_length: None,
+                            message_id: MSG_VIDEO_FOCUS_NOTIFICATION,
+                            payload: VIDEO_FOCUS_NATIVE_PAYLOAD.to_vec(),
+                        });
                     } else {
                         // Short press: the HU's original pulse already reached the phone
                         // (HeadUnit direction is now unfiltered), so voice activates on its
