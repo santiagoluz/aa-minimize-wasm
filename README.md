@@ -96,59 +96,49 @@ In the companion app or web UI (`http://10.0.0.1`), click **Download log**. You 
 scp -O root@10.0.0.1:/var/log/aa-proxy-rs.log ./aa-proxy-rs.log
 ```
 
-### 4. Parse the log with awk
+### 4. Parse the log
 
-Show every button press with its timestamp, deduplicated (the proxy sends each event twice):
+Use [`aa-log-report.sh`](aa-log-report.sh) to produce a combined timeline of button presses, touch events, and video focus changes:
 
 ```bash
-awk '
-/^[0-9]{4}-[0-9]{2}-[0-9]{2}, [0-9]{2}:[0-9]{2}:[0-9]{2}/ { ts = substr($0, 1, 26) }
-/key_event/ { in_key=1; kc=""; dn="" }
-in_key && /keycode:/ { kc = $2 }
-in_key && /down:/    { dn = $2; print ts, "keycode=" kc, "down=" dn; in_key=0 }
-' aa-proxy-rs.log | awk '
-{ key = $3 " " $4 }
-key != prev { print; prev = key }
-'
+bash aa-log-report.sh aa-proxy-rs.log
 ```
 
-To also measure hold duration and flag long presses (≥ 500 ms):
+Example output (button section relevant to keycode hunting):
+
+```
+2026-06-27, 01:14:30.790   [BTN]   keycode=84     short press  held=5ms
+2026-06-27, 01:15:38.917   [BTN]   keycode=87     LONG  press  held=533ms
+2026-06-27, 01:15:44.037   [BTN]   keycode=88     LONG  press  held=521ms
+```
+
+Set `KEYCODE_TRIGGER` in `src/lib.rs` to the keycode of the button you want to use.
+
+## Log analysis
+
+[`aa-log-report.sh`](aa-log-report.sh) generates a chronological timeline from an `aa-proxy-rs` log file, combining three event types:
+
+| Tag | What it shows |
+|-----|---------------|
+| `[BTN]` | Button presses — keycode, short/LONG, hold duration |
+| `[TOUCH]` | Touch events — 1/2-finger tap or swipe, coordinates, duration |
+| `[FOCUS]` | Video focus changes — `VIDEO_FOCUS_REQUEST` (HU→phone) and `VIDEO_FOCUS_NOTIFICATION` (phone→HU) |
 
 ```bash
-awk '
-function ts_to_ms(ts,    h, m, s) {
-    h = substr(ts, 13, 2) + 0
-    m = substr(ts, 16, 2) + 0
-    s = substr(ts, 19) + 0
-    return (h * 3600 + m * 60 + s) * 1000
-}
-/^[0-9]{4}-[0-9]{2}-[0-9]{2}, [0-9]{2}:[0-9]{2}:[0-9]{2}/ { ts = substr($0, 1, 26) }
-/key_event/ { in_key=1; kc=""; dn="" }
-in_key && /keycode:/ { kc = $2 }
-in_key && /down:/    { dn = $2; in_key = 0
-    if (dn == "true" && !(kc in down_ts)) {
-        down_ts[kc] = ts_to_ms(ts)
-        down_ts_str[kc] = ts
-    } else if (dn == "false" && (kc in down_ts)) {
-        dur = ts_to_ms(ts) - down_ts[kc]
-        label = (dur >= 500) ? "LONG  press" : "short press"
-        printf "%s  keycode=%-5s  %s  held=%dms\n", down_ts_str[kc], kc, label, dur
-        delete down_ts[kc]
-        delete down_ts_str[kc]
-    }
-}
-' aa-proxy-rs.log
+bash aa-log-report.sh aa-proxy-rs.log
 ```
 
 Example output:
 
 ```
-2026-06-27, 01:14:30.790   keycode=84     short press  held=5ms
-2026-06-27, 01:15:38.917   keycode=87     LONG  press  held=533ms
-2026-06-27, 01:15:44.037   keycode=88     LONG  press  held=521ms
+2026-06-30, 18:29:35.061   [TOUCH] 1-finger tap    x=41    y=404    156ms
+2026-06-30, 18:29:39.315   [BTN]   keycode=65540  LONG  press  held=2389ms
+2026-06-30, 18:30:41.505   [FOCUS] VIDEO_FOCUS_REQUEST → VIDEO_FOCUS_NATIVE (HU→phone)
+2026-06-30, 18:30:41.526   [FOCUS] VIDEO_FOCUS_NOTIFICATION → VIDEO_FOCUS_NATIVE unsolicited (phone→HU)
+2026-06-30, 18:31:03.729   [FOCUS] VIDEO_FOCUS_NOTIFICATION → VIDEO_FOCUS_PROJECTED unsolicited (phone→HU)
 ```
 
-Set `KEYCODE_TRIGGER` in `src/lib.rs` to the keycode of the button you want to use.
+Useful for verifying that a long-press triggered the focus transition and confirming the session stayed alive (no unexpected reconnect after the `NATIVE` notification).
 
 ## Build
 
