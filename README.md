@@ -9,14 +9,16 @@ Android Auto takes over the full screen, including the car's native bottom bar (
 When you **long-press** the configured button:
 1. The script detects the hold via repeated `down=true` events streamed by the phone (Phone → HU direction)
 2. It drops those events and sets a pending-exit flag
-3. On the next packet flowing from the HU toward the phone, it uses `replace-current` to inject a `VideoFocusNotification { focus: NATIVE }` message
-4. The phone receives the notification, gracefully stops projecting video, and sends `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
+3. On the next packet flowing from the HU toward the phone, it uses `replace-current` to inject a `VideoFocusRequestNotification { mode: NATIVE }` (message id `0x8007`)
+4. The phone receives the request — the same packet the real exit button sends — stops projecting video, keeps the TCP session alive, and replies with `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
 5. The HU switches to the native screen — session stays alive
 
 **Short-press** still works normally — the HU's original key pulse reaches the phone unmodified.
 
 > **Why inject to the phone, not the HU?**
-> Sending `VIDEO_FOCUS_NATIVE` directly to the HU causes it to drop the AA session, which then auto-reconnects. The correct flow (mirroring what happens when you tap the native exit button) is to tell the *phone* to release focus. The phone then notifies the HU itself, keeping both sides in sync and the session alive.
+> Sending `VIDEO_FOCUS_NATIVE` directly to the HU causes it to drop the AA session, which then auto-reconnects. The correct flow (mirroring what happens when you tap the native exit button) is to send a `VIDEO_FOCUS_REQUEST` (0x8007) *to the phone*. The phone handles that request natively: it stops projecting, keeps the TCP connection alive with keepalives, and notifies the HU itself — keeping both sides in sync and the session alive.
+>
+> Sending `VIDEO_FOCUS_NOTIFICATION` (0x8008) to the phone instead also causes a disconnect: the phone normally *sends* that message, not receives it, so it goes silent. The proxy's stall detector then sees zero bytes on the link and kills the connection after ~14 seconds.
 
 > **Why Phone → HU direction for timing?**
 > The HU always sends a brief ~20 ms pulse to the phone on key-down, regardless of how long

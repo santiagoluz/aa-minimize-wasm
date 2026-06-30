@@ -12,18 +12,23 @@ use std::time::Instant;
 const KEYCODE_TRIGGER: u32 = 65540;
 // INPUT_MESSAGE_INPUT_REPORT message ID
 const MSG_INPUT_REPORT: u16 = 0x8001;
-// MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION message ID
+// MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION message ID (sniffed to learn the video channel)
 const MSG_VIDEO_FOCUS_NOTIFICATION: u16 = 0x8008;
+// MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST message ID (what we inject)
+const MSG_VIDEO_FOCUS_REQUEST: u16 = 0x8007;
 // Minimum hold duration to classify as a long press
 const LONG_PRESS_MS: u128 = 500;
 
-// VideoFocusNotification { focus: VIDEO_FOCUS_NATIVE=2 } sent to the phone.
-// Mirrors what display.rs sends when rewriting a VIDEO_FOCUS_REQUEST from the HU.
-// The phone responds by stopping projection and sending VIDEO_FOCUS_NOTIFICATION
-// (NATIVE, unsolicited:true) to the HU, which cleanly switches the screen without
-// tearing down the AA session.
-// payload[0..2] = message_id 0x8008; payload[2..] = proto field1(focus)=varint(2)
-const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 4] = [0x80, 0x08, 0x08, 0x02];
+// VideoFocusRequestNotification { mode: VIDEO_FOCUS_NATIVE=2 } — identical to what
+// the physical HU sends when the driver taps the native exit button.
+// The phone is built to handle this request: it stops projecting, keeps the TCP
+// session alive, and replies with VideoFocusNotification(NATIVE, unsolicited:true)
+// so the HU knows to show the native screen. Sending 0x8007 (request) instead of
+// 0x8008 (notification) is critical — the proxy's stall detector watches raw byte
+// counters; a proper request lets the phone stay connected with keepalives rather
+// than going silent and triggering a stall disconnect.
+// payload[0..2] = message_id 0x8007; payload[2..] = proto field1(mode)=varint(2)
+const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 4] = [0x80, 0x07, 0x08, 0x02];
 
 // ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST — used by aa-proxy-rs for all
 // injected single-frame packets.
@@ -169,16 +174,16 @@ impl Guest for Component {
             VIDEO_CH.with(|c| c.set(pkt.channel));
         }
 
-        // ── Pending exit: inject VIDEO_FOCUS_NATIVE into the next HU→MD packet ─
-        // replace-current rewrites the packet in-place so it reaches the phone.
-        // The phone then stops projecting and sends VIDEO_FOCUS_NOTIFICATION
-        // (NATIVE, unsolicited:true) back to the HU, switching screens cleanly
-        // without tearing down the session.
+        // ── Pending exit: inject VIDEO_FOCUS_REQUEST(NATIVE) to the phone ───────
+        // replace-current rewrites the next HU→MD packet in-place so it flows
+        // to the phone as a VIDEO_FOCUS_REQUEST. This mirrors the real exit-button
+        // flow the phone expects: it stops projecting, keeps the TCP session alive,
+        // and replies with VIDEO_FOCUS_NOTIFICATION(NATIVE, unsolicited:true).
         if pkt.proxy_type == ProxyType::HeadUnit && PENDING_EXIT.with(|p| p.get()) {
             let ch = VIDEO_CH.with(|c| c.get());
             PENDING_EXIT.with(|p| p.set(false));
             aa::packet::host::info(&format!(
-                "[aa-minimize] injecting VIDEO_FOCUS_NATIVE to phone on ch {:#04x}",
+                "[aa-minimize] injecting VIDEO_FOCUS_REQUEST(NATIVE) to phone on ch {:#04x}",
                 ch
             ));
             aa::packet::host::replace_current(&Packet {
@@ -186,7 +191,7 @@ impl Guest for Component {
                 channel: ch,
                 packet_flags: PKT_FLAGS_SINGLE,
                 final_length: None,
-                message_id: MSG_VIDEO_FOCUS_NOTIFICATION,
+                message_id: MSG_VIDEO_FOCUS_REQUEST,
                 payload: VIDEO_FOCUS_NATIVE_PAYLOAD.to_vec(),
             });
             return Decision::Forward;
