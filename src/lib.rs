@@ -17,10 +17,13 @@ const MSG_VIDEO_FOCUS_NOTIFICATION: u16 = 0x8008;
 // Minimum hold duration to classify as a long press
 const LONG_PRESS_MS: u128 = 500;
 
-// VideoFocusNotification { focus: VIDEO_FOCUS_NATIVE=2, unsolicited: true }
-// payload[0..2] = message_id 0x8008 (aa-proxy-rs convention: msg_id lives in payload)
-// payload[2..] = proto: field1(focus)=varint(2), field2(unsolicited)=varint(1)
-const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 6] = [0x80, 0x08, 0x08, 0x02, 0x10, 0x01];
+// VideoFocusNotification { focus: VIDEO_FOCUS_NATIVE=2 } sent to the phone.
+// Mirrors what display.rs sends when rewriting a VIDEO_FOCUS_REQUEST from the HU.
+// The phone responds by stopping projection and sending VIDEO_FOCUS_NOTIFICATION
+// (NATIVE, unsolicited:true) to the HU, which cleanly switches the screen without
+// tearing down the AA session.
+// payload[0..2] = message_id 0x8008; payload[2..] = proto field1(focus)=varint(2)
+const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 4] = [0x80, 0x08, 0x08, 0x02];
 
 // ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST — used by aa-proxy-rs for all
 // injected single-frame packets.
@@ -40,6 +43,9 @@ thread_local! {
     // Video channel learned from the first VIDEO_FOCUS_NOTIFICATION seen in
     // the session. Defaults to 0x11, which is the typical value.
     static VIDEO_CH: Cell<u8> = Cell::new(0x11);
+    // Set to true on long press; cleared when the next HU→MD packet is replaced
+    // with VIDEO_FOCUS_NATIVE so it flows to the phone.
+    static PENDING_EXIT: Cell<bool> = Cell::new(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +169,29 @@ impl Guest for Component {
             VIDEO_CH.with(|c| c.set(pkt.channel));
         }
 
+        // ── Pending exit: inject VIDEO_FOCUS_NATIVE into the next HU→MD packet ─
+        // replace-current rewrites the packet in-place so it reaches the phone.
+        // The phone then stops projecting and sends VIDEO_FOCUS_NOTIFICATION
+        // (NATIVE, unsolicited:true) back to the HU, switching screens cleanly
+        // without tearing down the session.
+        if pkt.proxy_type == ProxyType::HeadUnit && PENDING_EXIT.with(|p| p.get()) {
+            let ch = VIDEO_CH.with(|c| c.get());
+            PENDING_EXIT.with(|p| p.set(false));
+            aa::packet::host::info(&format!(
+                "[aa-minimize] injecting VIDEO_FOCUS_NATIVE to phone on ch {:#04x}",
+                ch
+            ));
+            aa::packet::host::replace_current(&Packet {
+                proxy_type: ProxyType::HeadUnit,
+                channel: ch,
+                packet_flags: PKT_FLAGS_SINGLE,
+                final_length: None,
+                message_id: MSG_VIDEO_FOCUS_NOTIFICATION,
+                payload: VIDEO_FOCUS_NATIVE_PAYLOAD.to_vec(),
+            });
+            return Decision::Forward;
+        }
+
         // ── Debug: log every key event with its direction ───────────────────
         if pkt.message_id == MSG_INPUT_REPORT && pkt.payload.len() >= 2 {
             if let Some((keycode, down)) = parse_key(&pkt.payload[2..]) {
@@ -223,23 +252,11 @@ impl Guest for Component {
                     s.set(PressState::Handled);
 
                     if elapsed_ms >= LONG_PRESS_MS {
-                        let ch = VIDEO_CH.with(|c| c.get());
                         aa::packet::host::info(&format!(
-                            "[aa-minimize] long press {}ms → VIDEO_FOCUS_NATIVE on ch {:#04x}",
-                            elapsed_ms, ch
+                            "[aa-minimize] long press {}ms → scheduling VIDEO_FOCUS_NATIVE",
+                            elapsed_ms
                         ));
-                        // Inject VideoFocusNotification { focus: NATIVE, unsolicited: true }
-                        // directly into the media_sink channel. This is what the phone's AA
-                        // app sends when the user taps the exit/vehicle-logo button — it
-                        // causes the HU to release AA and return to the native screen.
-                        aa::packet::host::send(&Packet {
-                            proxy_type: ProxyType::MobileDevice,
-                            channel: ch,
-                            packet_flags: PKT_FLAGS_SINGLE,
-                            final_length: None,
-                            message_id: MSG_VIDEO_FOCUS_NOTIFICATION,
-                            payload: VIDEO_FOCUS_NATIVE_PAYLOAD.to_vec(),
-                        });
+                        PENDING_EXIT.with(|p| p.set(true));
                     } else {
                         // Short press: the HU's original pulse already reached the phone
                         // (HeadUnit direction is now unfiltered), so voice activates on its
