@@ -19,16 +19,17 @@ const MSG_VIDEO_FOCUS_REQUEST: u16 = 0x8007;
 // Minimum hold duration to classify as a long press
 const LONG_PRESS_MS: u128 = 500;
 
-// VideoFocusRequestNotification { mode: VIDEO_FOCUS_NATIVE=2 } — identical to what
-// the physical HU sends when the driver taps the native exit button.
-// The phone is built to handle this request: it stops projecting, keeps the TCP
-// session alive, and replies with VideoFocusNotification(NATIVE, unsolicited:true)
-// so the HU knows to show the native screen. Sending 0x8007 (request) instead of
-// 0x8008 (notification) is critical — the proxy's stall detector watches raw byte
-// counters; a proper request lets the phone stay connected with keepalives rather
-// than going silent and triggering a stall disconnect.
-// payload[0..2] = message_id 0x8007; payload[2..] = proto field1(mode)=varint(2)
-const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 4] = [0x80, 0x07, 0x08, 0x02];
+// VideoFocusRequestNotification { mode: VIDEO_FOCUS_NATIVE, reason: UNKNOWN }
+// Byte-for-byte match with what the physical HU sends when the native exit button
+// is tapped. Proto layout (protos.proto):
+//   field 1 = disp_channel_id (deprecated, ignored)
+//   field 2 = VideoFocusMode mode
+//   field 3 = VideoFocusReason reason
+// Encoding:
+//   [0x80, 0x07]  message_id 0x8007
+//   [0x10, 0x02]  tag=(field2, varint) value=2 (VIDEO_FOCUS_NATIVE)
+//   [0x18, 0x00]  tag=(field3, varint) value=0 (UNKNOWN) — matches real HU output
+const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 6] = [0x80, 0x07, 0x10, 0x02, 0x18, 0x00];
 
 // ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST — used by aa-proxy-rs for all
 // injected single-frame packets.
@@ -183,8 +184,8 @@ impl Guest for Component {
             let ch = VIDEO_CH.with(|c| c.get());
             PENDING_EXIT.with(|p| p.set(false));
             aa::packet::host::info(&format!(
-                "[aa-minimize] injecting VIDEO_FOCUS_REQUEST(NATIVE) to phone on ch {:#04x}",
-                ch
+                "[aa-minimize] injecting VIDEO_FOCUS_REQUEST(NATIVE) on ch {:#04x} payload={:02x?}",
+                ch, &VIDEO_FOCUS_NATIVE_PAYLOAD
             ));
             aa::packet::host::replace_current(&Packet {
                 proxy_type: ProxyType::HeadUnit,
