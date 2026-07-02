@@ -22,8 +22,15 @@ function ts_ms(t,    a) {
 }
 
 # ── Button presses ─────────────────────────────────────────────────────────────
+# pkt_ts tracks the InputReport proto timestamp so we can skip synthetic
+# injected packets (timestamp: 0) that would otherwise create phantom entries.
 
-/key_event/ { in_key=1; kc=""; dn="" }
+/message_id = 8001/ { pkt_ts = "" }
+/^  timestamp: /    { pkt_ts = $2 }
+
+# Only enter key-tracking for packets with a non-zero timestamp.
+# timestamp=0 means a synthetic packet injected by the WASM hook.
+/key_event/ { in_key = (pkt_ts != "0"); kc=""; dn="" }
 
 in_key && /keycode:/ { kc = $2 }
 
@@ -33,10 +40,16 @@ in_key && /down:/ {
         btn_down_ms[kc]  = ts_ms(ts)
         btn_down_str[kc] = ts
     } else if (dn == "false" && (kc in btn_down_ms)) {
-        dur   = ts_ms(ts) - btn_down_ms[kc]
-        label = (dur >= 500) ? "LONG " : "short"
-        printf "%s  [BTN]   keycode=%-5s  %s press  held=%dms\n",
-               btn_down_str[kc], kc, label, dur
+        dur = ts_ms(ts) - btn_down_ms[kc]
+        if (dur < 0) dur += 3600000
+        # Skip implausibly long durations caused by NTP clock jumps in the log
+        # timestamps (the WASM itself uses a monotonic clock so it is unaffected;
+        # this is purely a log-parsing artifact).
+        if (dur <= 60000) {
+            label = (dur >= 500) ? "LONG " : "short"
+            printf "%s  [BTN]   keycode=%-5s  %s press  held=%dms\n",
+                   btn_down_str[kc], kc, label, dur
+        }
         delete btn_down_ms[kc]
         delete btn_down_str[kc]
     }
@@ -82,7 +95,7 @@ in_vfn && /^}$/ {
 # ── Touch events ───────────────────────────────────────────────────────────────
 
 /message_id = 8001/ {
-    in_input = 1; action = ""
+    in_input = 1; action = ""; pkt_ts = ""
     delete ptr_x; delete ptr_y
 }
 

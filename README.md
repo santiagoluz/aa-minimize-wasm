@@ -8,12 +8,18 @@ Android Auto takes over the full screen, including the car's native bottom bar (
 
 When you **long-press** the configured button:
 1. The script detects the hold via repeated `down=true` events streamed by the phone (Phone → HU direction)
-2. It drops those events and sets a pending-exit flag
-3. On the next packet flowing from the HU toward the phone, it uses `replace-current` to inject a `VideoFocusRequestNotification { mode: NATIVE }` (message id `0x8007`)
+2. It drops those events while timing the hold with a monotonic clock
+3. On release (≥ 500 ms), it injects a `VideoFocusRequestNotification { mode: NATIVE }` (message id `0x8007`) via `send()` — a new packet added to the stream, without touching any existing packets
 4. The phone receives the request — the same packet the real exit button sends — stops projecting video, keeps the TCP session alive, and replies with `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
 5. The HU switches to the native screen — session stays alive
 
-**Short-press** still works normally — the HU's original key pulse reaches the phone unmodified.
+When you **short-press** the configured button:
+1. The script tracks the hold the same way, but on release before the long-press threshold, it re-injects a synthetic key-down toward the phone (the original MD→HU down=true events were dropped while tracking the hold, so the phone never received the repeated key stream) and forwards the real key-up
+2. This reconstructs a minimal key-down/key-up pair at the phone side, which is what triggers the Android Auto voice assistant action
+
+The HU's own ~20ms key-down pulse alone is not sufficient to trigger the voice action — the phone needs to receive the complete key event to act on it.
+
+**During a phone call**, the script detects that AA has released video focus (phone sends `VIDEO_FOCUS_NOTIFICATION(NATIVE)`) and stops intercepting the button entirely. Key events pass through unmodified so call-management actions (end call, etc.) work normally. Interception resumes when AA takes focus again (`VIDEO_FOCUS_PROJECTED`).
 
 > **Why inject to the phone, not the HU?**
 > Sending `VIDEO_FOCUS_NATIVE` directly to the HU causes it to drop the AA session, which then auto-reconnects. The correct flow (mirroring what happens when you tap the native exit button) is to send a `VIDEO_FOCUS_REQUEST` (0x8007) *to the phone*. The phone handles that request natively: it stops projecting, keeps the TCP connection alive with keepalives, and notifies the HU itself — keeping both sides in sync and the session alive.
@@ -35,9 +41,10 @@ The proxy sends each key event twice (once per direction). The script handles th
 |-------|-------|--------|
 | Idle | `down=true` | → Pressed, drop packet |
 | Pressed | `down=true` | Stay Pressed, drop (proxy duplicate / key repeat) |
-| Pressed, held ≥ 500 ms | `down=false` | → Handled, schedule exit (replace next HU→MD packet) |
-| Pressed, held < 500 ms | `down=false` | → Handled, drop (short press — HU pulse already triggered the action) |
+| Pressed, held ≥ 500 ms | `down=false` | → Handled, inject VIDEO_FOCUS_REQUEST via `send()` |
+| Pressed, held < 500 ms | `down=false` | → Handled, re-inject key-down to phone, forward this key-up |
 | Handled | `down=false` | → Idle, drop (proxy duplicate) |
+| Any (FOCUS=Native) | any | → Forward immediately (call in progress, don't intercept) |
 
 ## Configuration
 
@@ -49,6 +56,10 @@ const KEYCODE_TRIGGER: u32 = 65540;
 
 // How long the button must be held to trigger the long press action (milliseconds)
 const LONG_PRESS_MS: u128 = 500;
+
+// Minimum interval between consecutive VIDEO_FOCUS_REQUEST injections (milliseconds).
+// Sending requests too quickly can disturb the AA session.
+const EXIT_COOLDOWN_MS: u128 = 5_000;
 ```
 
 To intercept a different button, replace `65540` with the keycode your car sends for that button.
