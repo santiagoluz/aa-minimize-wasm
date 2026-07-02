@@ -1,23 +1,36 @@
 # aa-minimize-wasm
 
-A [WASM hook script](https://github.com/aa-proxy/aa-proxy-rs) for `aa-proxy-rs` that intercepts a steering wheel button long-press and sends `KEYCODE_HOME` to Android Auto, minimizing it and returning to the car's native screen.
+A [WASM hook script](https://github.com/aa-proxy/aa-proxy-rs) for `aa-proxy-rs` that intercepts a steering wheel button long-press and returns to the car's native screen without disconnecting Android Auto.
 
 ## How it works
 
-Android Auto takes over the full screen, including the car's native bottom bar (AC, driving mode, etc.). This script lets you get back to the native UI without touching the phone.
+Android Auto takes over the full screen, including the car's native bottom bar (AC, driving mode, etc.). This script lets you get back to the native UI without touching the phone — and without closing the AA session, so you can tap the AA icon on the native screen to resume instantly.
 
 When you **long-press** the configured button:
-- The script detects the hold via repeated `down=true` events streamed by the phone (Phone → HU direction)
-- It drops those events and injects `KEYCODE_HOME` via the aa-proxy-rs REST API
-- Android Auto minimizes and the car's native screen is restored
+1. The script detects the hold via repeated `down=true` events streamed by the phone (Phone → HU direction)
+2. It drops those events while timing the hold with a monotonic clock
+3. On release (≥ 500 ms), it injects a `VideoFocusRequestNotification { mode: NATIVE }` (message id `0x8007`) via `send()` — a new packet added to the stream, without touching any existing packets
+4. The phone receives the request — the same packet the real exit button sends — stops projecting video, keeps the TCP session alive, and replies with `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
+5. The HU switches to the native screen — session stays alive
 
-**Short-press** still works normally — the HU's original key pulse reaches the phone unmodified, so whatever the button normally does (e.g. open an assistant) still happens.
+When you **short-press** the configured button:
+1. The script tracks the hold the same way, but on release before the long-press threshold, it re-injects a synthetic key-down toward the phone (the original MD→HU down=true events were dropped while tracking the hold, so the phone never received the repeated key stream) and forwards the real key-up
+2. This reconstructs a minimal key-down/key-up pair at the phone side, which is what triggers the Android Auto voice assistant action
 
-> **Why Phone → HU direction?**
-> The HU always sends a brief ~20ms pulse to the phone on key-down, regardless of how long
+The HU's own ~20ms key-down pulse alone is not sufficient to trigger the voice action — the phone needs to receive the complete key event to act on it.
+
+**During a phone call**, the script detects that AA has released video focus (phone sends `VIDEO_FOCUS_NOTIFICATION(NATIVE)`) and stops intercepting the button entirely. Key events pass through unmodified so call-management actions (end call, etc.) work normally. Interception resumes when AA takes focus again (`VIDEO_FOCUS_PROJECTED`).
+
+> **Why inject to the phone, not the HU?**
+> Sending `VIDEO_FOCUS_NATIVE` directly to the HU causes it to drop the AA session, which then auto-reconnects. The correct flow (mirroring what happens when you tap the native exit button) is to send a `VIDEO_FOCUS_REQUEST` (0x8007) *to the phone*. The phone handles that request natively: it stops projecting, keeps the TCP connection alive with keepalives, and notifies the HU itself — keeping both sides in sync and the session alive.
+>
+> Sending `VIDEO_FOCUS_NOTIFICATION` (0x8008) to the phone instead also causes a disconnect: the phone normally *sends* that message, not receives it, so it goes silent. The proxy's stall detector then sees zero bytes on the link and kills the connection after ~14 seconds.
+
+> **Why Phone → HU direction for timing?**
+> The HU always sends a brief ~20 ms pulse to the phone on key-down, regardless of how long
 > you physically hold the button — so there is no hold-time information in the HeadUnit direction.
 > The phone translates that pulse into a stream of repeated `down=true` events sent back to the HU
-> every ~50ms while the button is held, followed by a single `down=false` on release. That stream
+> every ~50 ms while the button is held, followed by a single `down=false` on release. That stream
 > is what the script intercepts and times.
 
 ### State machine
@@ -28,9 +41,10 @@ The proxy sends each key event twice (once per direction). The script handles th
 |-------|-------|--------|
 | Idle | `down=true` | → Pressed, drop packet |
 | Pressed | `down=true` | Stay Pressed, drop (proxy duplicate / key repeat) |
-| Pressed, held ≥ 500 ms | `down=false` | → Handled, inject `KEYCODE_HOME` |
-| Pressed, held < 500 ms | `down=false` | → Handled, drop (short press — HU pulse already triggered the action) |
+| Pressed, held ≥ 500 ms | `down=false` | → Handled, inject VIDEO_FOCUS_REQUEST via `send()` |
+| Pressed, held < 500 ms | `down=false` | → Handled, re-inject key-down to phone, forward this key-up |
 | Handled | `down=false` | → Idle, drop (proxy duplicate) |
+| Any (FOCUS=Native) | any | → Forward immediately (call in progress, don't intercept) |
 
 ## Configuration
 
@@ -40,11 +54,12 @@ Open [`src/lib.rs`](src/lib.rs) and adjust these constants at the top:
 // Steering wheel button to intercept (set to your car's keycode)
 const KEYCODE_TRIGGER: u32 = 65540;
 
-// Key to inject on long press (default: KEYCODE_HOME = 3)
-const KEYCODE_HOME: u32 = 3;
-
 // How long the button must be held to trigger the long press action (milliseconds)
 const LONG_PRESS_MS: u128 = 500;
+
+// Minimum interval between consecutive VIDEO_FOCUS_REQUEST injections (milliseconds).
+// Sending requests too quickly can disturb the AA session.
+const EXIT_COOLDOWN_MS: u128 = 5_000;
 ```
 
 To intercept a different button, replace `65540` with the keycode your car sends for that button.
@@ -92,61 +107,55 @@ In the companion app or web UI (`http://10.0.0.1`), click **Download log**. You 
 scp -O root@10.0.0.1:/var/log/aa-proxy-rs.log ./aa-proxy-rs.log
 ```
 
-### 4. Parse the log with awk
+### 4. Parse the log
 
-Show every button press with its timestamp, deduplicated (the proxy sends each event twice):
+Use [`aa-log-report.sh`](aa-log-report.sh) to produce a combined timeline of button presses, touch events, and video focus changes:
 
 ```bash
-awk '
-/^[0-9]{4}-[0-9]{2}-[0-9]{2}, [0-9]{2}:[0-9]{2}:[0-9]{2}/ { ts = substr($0, 1, 26) }
-/key_event/ { in_key=1; kc=""; dn="" }
-in_key && /keycode:/ { kc = $2 }
-in_key && /down:/    { dn = $2; print ts, "keycode=" kc, "down=" dn; in_key=0 }
-' aa-proxy-rs.log | awk '
-{ key = $3 " " $4 }
-key != prev { print; prev = key }
-'
+bash aa-log-report.sh aa-proxy-rs.log
 ```
 
-To also measure hold duration and flag long presses (≥ 500 ms):
+Example output (button section relevant to keycode hunting):
+
+```
+2026-06-27, 01:14:30.790   [BTN]   keycode=84     short press  held=5ms
+2026-06-27, 01:15:38.917   [BTN]   keycode=87     LONG  press  held=533ms
+2026-06-27, 01:15:44.037   [BTN]   keycode=88     LONG  press  held=521ms
+```
+
+Set `KEYCODE_TRIGGER` in `src/lib.rs` to the keycode of the button you want to use.
+
+## Log analysis
+
+[`aa-log-report.sh`](aa-log-report.sh) generates a chronological timeline from an `aa-proxy-rs` log file, combining three event types:
+
+| Tag | What it shows |
+|-----|---------------|
+| `[BTN]` | Button presses — keycode, short/LONG, hold duration |
+| `[TOUCH]` | Touch events — 1/2-finger tap or swipe, coordinates, duration |
+| `[FOCUS]` | Video focus changes — `VIDEO_FOCUS_REQUEST` (HU→phone) and `VIDEO_FOCUS_NOTIFICATION` (phone→HU) |
 
 ```bash
-awk '
-function ts_to_ms(ts,    h, m, s) {
-    h = substr(ts, 13, 2) + 0
-    m = substr(ts, 16, 2) + 0
-    s = substr(ts, 19) + 0
-    return (h * 3600 + m * 60 + s) * 1000
-}
-/^[0-9]{4}-[0-9]{2}-[0-9]{2}, [0-9]{2}:[0-9]{2}:[0-9]{2}/ { ts = substr($0, 1, 26) }
-/key_event/ { in_key=1; kc=""; dn="" }
-in_key && /keycode:/ { kc = $2 }
-in_key && /down:/    { dn = $2; in_key = 0
-    if (dn == "true" && !(kc in down_ts)) {
-        down_ts[kc] = ts_to_ms(ts)
-        down_ts_str[kc] = ts
-    } else if (dn == "false" && (kc in down_ts)) {
-        dur = ts_to_ms(ts) - down_ts[kc]
-        label = (dur >= 500) ? "LONG  press" : "short press"
-        printf "%s  keycode=%-5s  %s  held=%dms\n", down_ts_str[kc], kc, label, dur
-        delete down_ts[kc]
-        delete down_ts_str[kc]
-    }
-}
-' aa-proxy-rs.log
+bash aa-log-report.sh aa-proxy-rs.log
 ```
 
 Example output:
 
 ```
-2026-06-27, 01:14:30.790   keycode=84     short press  held=5ms
-2026-06-27, 01:15:38.917   keycode=87     LONG  press  held=533ms
-2026-06-27, 01:15:44.037   keycode=88     LONG  press  held=521ms
+2026-06-30, 18:29:35.061   [TOUCH] 1-finger tap    x=41    y=404    156ms
+2026-06-30, 18:29:39.315   [BTN]   keycode=65540  LONG  press  held=2389ms
+2026-06-30, 18:30:41.505   [FOCUS] VIDEO_FOCUS_REQUEST → VIDEO_FOCUS_NATIVE (HU→phone)
+2026-06-30, 18:30:41.526   [FOCUS] VIDEO_FOCUS_NOTIFICATION → VIDEO_FOCUS_NATIVE unsolicited (phone→HU)
+2026-06-30, 18:31:03.729   [FOCUS] VIDEO_FOCUS_NOTIFICATION → VIDEO_FOCUS_PROJECTED unsolicited (phone→HU)
 ```
 
-Set `KEYCODE_VOICE` in `src/lib.rs` to the keycode of the button you want to use.
+Useful for verifying that a long-press triggered the focus transition and confirming the session stayed alive (no unexpected reconnect after the `NATIVE` notification).
 
 ## Build
+
+> **Toolchain note:** `wit-bindgen` must be pinned to `=0.51.0` to match the `wasmtime 38`
+> embedded in `aa-proxy-rs`. The `Cargo.toml` in this repo already has this pinned — do not
+> upgrade it, or the generated WASM component format will be incompatible with the host runtime.
 
 ```bash
 # Install Rust (if not already installed)
@@ -167,9 +176,19 @@ Output: `target/wasm32-wasip2/release/aa_minimize_wasm.wasm`
 Copy the `.wasm` file to `/data/wasm-hooks/` on the device. aa-proxy-rs watches that directory and hot-reloads scripts automatically — no restart needed.
 
 ```bash
-# From Linux / WSL2
 scp -O target/wasm32-wasip2/release/aa_minimize_wasm.wasm root@10.0.0.1:/data/wasm-hooks/
+ssh root@10.0.0.1 "sync && md5sum /data/wasm-hooks/aa_minimize_wasm.wasm"
 ```
+
+Verify the md5 on the Pi matches the local file before testing:
+
+```bash
+md5sum target/wasm32-wasip2/release/aa_minimize_wasm.wasm
+```
+
+> **Important:** Always run `sync` on the Pi after uploading. The kernel's write-back cache
+> means the file may not be fully written to the SD card yet. If the Pi loses power (ignition off)
+> before the cache is flushed, the file will be corrupted. `sync` forces an immediate flush.
 
 > **Note:** The device Wi-Fi (`aa-proxy` / `aa-proxy`) is used by the phone while Android Auto is running.
 > To connect your laptop, temporarily disconnect the phone (enable airplane mode on the phone, then re-enable Wi-Fi only and connect manually to the car's Bluetooth for calls if needed).
@@ -178,5 +197,5 @@ scp -O target/wasm32-wasip2/release/aa_minimize_wasm.wasm root@10.0.0.1:/data/wa
 Confirm it loaded by checking the log for:
 ```
 [wasm] loaded wasm script: /data/wasm-hooks/aa_minimize_wasm.wasm
-[aa-minimize] loaded: long-press Voice/Mic → KEYCODE_HOME
+[aa-minimize] loaded: long-press keycode 65540 → VIDEO_FOCUS_NATIVE
 ```
