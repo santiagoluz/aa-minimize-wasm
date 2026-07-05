@@ -2,6 +2,12 @@
 
 A [WASM hook script](https://github.com/aa-proxy/aa-proxy-rs) for `aa-proxy-rs` that intercepts a steering wheel button long-press and returns to the car's native screen without disconnecting Android Auto.
 
+## Background
+
+This was built for the **GAC AION Y** (as sold in Brazil). On its current firmware there is no easy way to minimize Android Auto — exiting requires tapping through 2–3 specific on-screen icons — and while AA is running it takes over the **whole screen**, hiding the car system's bottom bar and its shortcuts (AC, air recirculation, etc.). The goal of this script is a better UX: a single steering-wheel long-press to minimize AA and get back to the car's own menu, without tearing down the AA session.
+
+The specifics here (keycodes, the exit-icon coordinate, the head unit's focus behaviour) were reverse-engineered from that car's traffic. They may differ on other head units — see [Finding your keycodes](#finding-your-keycodes).
+
 ## How it works
 
 Android Auto takes over the full screen, including the car's native bottom bar (AC, driving mode, etc.). This script lets you get back to the native UI without touching the phone — and without closing the AA session, so you can tap the AA icon on the native screen to resume instantly.
