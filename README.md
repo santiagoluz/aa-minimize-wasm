@@ -9,9 +9,11 @@ Android Auto takes over the full screen, including the car's native bottom bar (
 When you **long-press** the configured button:
 1. The script detects the hold via repeated `down=true` events streamed by the phone (Phone → HU direction)
 2. It drops those events while timing the hold with a monotonic clock
-3. On release (≥ 500 ms), it injects a `VideoFocusRequestNotification { mode: NATIVE }` (message id `0x8007`) via `send()` — a new packet added to the stream, without touching any existing packets
-4. The phone receives the request — the same packet the real exit button sends — stops projecting video, keeps the TCP session alive, and replies with `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
-5. The HU switches to the native screen — session stays alive
+3. On release (≥ 500 ms), it injects a `VideoFocusRequestNotification { mode: NATIVE, reason: UNKNOWN }` (message id `0x8007`) via `send()` — a new packet added to the stream, without touching any existing packets
+4. The phone receives the request, stops projecting video, keeps the TCP session alive (a steady ~85 B/s keepalive), and replies with `VideoFocusNotification { focus: NATIVE, unsolicited: true }` back to the HU
+5. The HU switches to the native screen — session stays alive, and AA audio keeps playing
+
+See [Reliability and limitations](#reliability-and-limitations) for when this can fail.
 
 When you **short-press** the configured button:
 1. The script tracks the hold the same way, but on release before the long-press threshold, it re-injects a synthetic key-down toward the phone (the original MD→HU down=true events were dropped while tracking the hold, so the phone never received the repeated key stream) and forwards the real key-up
@@ -21,10 +23,11 @@ The HU's own ~20ms key-down pulse alone is not sufficient to trigger the voice a
 
 **During a phone call**, the script detects that AA has released video focus (phone sends `VIDEO_FOCUS_NOTIFICATION(NATIVE)`) and stops intercepting the button entirely. Key events pass through unmodified so call-management actions (end call, etc.) work normally. Interception resumes when AA takes focus again (`VIDEO_FOCUS_PROJECTED`).
 
-> **Why inject to the phone, not the HU?**
-> Sending `VIDEO_FOCUS_NATIVE` directly to the HU causes it to drop the AA session, which then auto-reconnects. The correct flow (mirroring what happens when you tap the native exit button) is to send a `VIDEO_FOCUS_REQUEST` (0x8007) *to the phone*. The phone handles that request natively: it stops projecting, keeps the TCP connection alive with keepalives, and notifies the HU itself — keeping both sides in sync and the session alive.
+> **Why inject a request to the phone, not a notification to the HU?**
+> Sending `VIDEO_FOCUS_NOTIFICATION(NATIVE)` (0x8008) directly to the HU causes it to drop the AA session, which then auto-reconnects. And sending `0x8008` to the *phone* also disconnects: the phone normally *sends* that message, not receives it, so it goes silent, and the proxy's stall detector kills the link after ~10–14 s of zero bytes.
+> The working approach is to send a `VIDEO_FOCUS_REQUEST` (0x8007) *to the phone*: the phone stops projecting, keeps the TCP connection alive with keepalives, and notifies the HU itself — keeping both sides in sync and AA audio playing.
 >
-> Sending `VIDEO_FOCUS_NOTIFICATION` (0x8008) to the phone instead also causes a disconnect: the phone normally *sends* that message, not receives it, so it goes silent. The proxy's stall detector then sees zero bytes on the link and kills the connection after ~14 seconds.
+> Note: the car's *own* native takeovers (the app-drawer "Exit app" tile, the rear-camera view, a seat-belt popup) do **not** use `0x8007` at all — the phone emits an unsolicited `NATIVE` notification on its own, triggered by something outside the Android-Auto stream (hardware display switching). That path is not reproducible by injection; `0x8007` is the only injectable trigger that keeps audio.
 
 > **Why Phone → HU direction for timing?**
 > The HU always sends a brief ~20 ms pulse to the phone on key-down, regardless of how long
@@ -32,6 +35,17 @@ The HU's own ~20ms key-down pulse alone is not sufficient to trigger the voice a
 > The phone translates that pulse into a stream of repeated `down=true` events sent back to the HU
 > every ~50 ms while the button is held, followed by a single `down=false` on release. That stream
 > is what the script intercepts and times.
+
+## Reliability and limitations
+
+The long-press minimize works reliably in normal use, but it can occasionally fail — and when it does, the AA session drops and auto-reconnects after ~10–14 s. This is understood and is a phone-side limitation, not a bug in the script:
+
+- **When it fails:** only under a heavy video stream (e.g. Waze zoomed right out with lots of moving map, plus music). Under that load the phone receives the `0x8007` request and stops projecting, but sometimes never completes the focus handshake — it sends no `NATIVE` notification back and starts no keepalive. Both traffic directions then fall to **0 bytes**, and the proxy's stall detector (`timeout_secs`, default 10) drops the link.
+- **Why it can't be fixed here:** the request *is* delivered and acted on (video stops immediately), so it isn't packet loss or channel congestion — it's a race inside the phone while it is CPU-bound encoding video. `0x8007` is also protocol-bound to the video channel, so a different channel is not an option. Raising `timeout_secs` doesn't help either: the stream is genuinely frozen, so a longer timeout only delays the (recovering) reconnect.
+- **What is unaffected:** whenever the phone *does* acknowledge (the common case), it settles into a steady ~85 B/s bidirectional keepalive and the minimized session survives indefinitely, with audio still playing.
+- **Reliable fallback:** the head unit's own **MODE / audio-source button** always defocuses AA cleanly — but it switches audio to the radio (it drops AA audio), which is why this script exists for the audio-preserving case.
+
+This was investigated at length by comparing captures of the script's injection against the car's native takeovers (MODE, rear camera, seat-belt popup) with full packet logging. The native takeovers keep audio *and* never fail, but they are phone-initiated with **no trigger anywhere in the Android-Auto stream** (all service kinds captured), so they cannot be reproduced by injection.
 
 ### State machine
 

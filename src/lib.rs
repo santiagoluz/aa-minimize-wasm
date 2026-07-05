@@ -20,15 +20,29 @@ const MSG_VIDEO_FOCUS_REQUEST: u16 = 0x8007;
 const LONG_PRESS_MS: u128 = 500;
 
 // VideoFocusRequestNotification { mode: VIDEO_FOCUS_NATIVE, reason: UNKNOWN }
-// Byte-for-byte match with what the physical HU sends when the native exit button
-// is tapped. Proto layout (protos.proto):
+// A HU→phone request asking the phone to release video focus to the car's native
+// screen. This is the only injectable message that minimizes AA while keeping
+// audio playing (see the reliability note below). Proto layout (protos.proto):
 //   field 1 = disp_channel_id (deprecated, ignored)
-//   field 2 = VideoFocusMode mode
-//   field 3 = VideoFocusReason reason
+//   field 2 = VideoFocusMode mode    (VIDEO_FOCUS_PROJECTED=1, VIDEO_FOCUS_NATIVE=2)
+//   field 3 = VideoFocusReason reason (UNKNOWN=0, PHONE_SCREEN_OFF=1, LAUNCH_NATIVE=2)
 // Encoding:
 //   [0x80, 0x07]  message_id 0x8007
 //   [0x10, 0x02]  tag=(field2, varint) value=2 (VIDEO_FOCUS_NATIVE)
-//   [0x18, 0x00]  tag=(field3, varint) value=0 (UNKNOWN) — matches real HU output
+//   [0x18, 0x00]  tag=(field3, varint) value=0 (UNKNOWN)
+//
+// reason=UNKNOWN matches every real 0x8007 VIDEO_FOCUS_REQUEST observed on the
+// wire. reason=LAUNCH_NATIVE (2) was tried and made no difference to reliability.
+//
+// RELIABILITY: under a heavy video stream (e.g. Waze zoomed out), the phone
+// occasionally receives this request, stops projecting, but never completes the
+// focus handshake (no NATIVE notification back, no keepalive) → the link goes
+// silent and the proxy's stall detector drops it (~10-14s, auto-reconnects).
+// This is a phone-side race while it is CPU-bound encoding video; it is not
+// fixable from here — the request is delivered and acted on, the phone just
+// fails to finish. The car's own native takeovers (rear camera, seat-belt popup)
+// avoid this but are phone-initiated with no injectable trigger in the AA stream.
+// The MODE / audio-source button is the reliable fallback (it drops audio).
 const VIDEO_FOCUS_NATIVE_PAYLOAD: [u8; 6] = [0x80, 0x07, 0x10, 0x02, 0x18, 0x00];
 
 // InputReport { timestamp:0, key_event { keys { keycode:KEYCODE_TRIGGER, down:X, metastate:0 } } }
