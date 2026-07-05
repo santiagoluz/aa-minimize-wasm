@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage: aa-log-report.sh <logfile>
 # Produces a combined chronological timeline of button presses, touch events,
-# and video focus changes from an aa-proxy-rs log file.
+# video focus changes, and connection lifecycle events (connect / reconnect,
+# stalls, session end) from an aa-proxy-rs log file.
 
 set -euo pipefail
 
@@ -11,6 +12,9 @@ if [[ $# -lt 1 ]]; then
 fi
 
 awk -v SWIPE_PX=75 '
+
+# ESC byte, used to strip ANSI colour codes from proxy status lines.
+BEGIN { esc = sprintf("%c", 27) }
 
 function ts_ms(t,    a) {
     split(t, a, /[,. :]/)
@@ -90,6 +94,32 @@ in_vfn && /^}$/ {
         }
         vfn_focus = ""; vfn_unsol = ""; in_vfn = 0
     }
+}
+
+# ── Connection lifecycle ───────────────────────────────────────────────────────
+# The proxy status lines carry ANSI colour codes after the timestamp, so strip
+# them before pulling out the detail. These mark when the phone (re)connects, when
+# the stall detector drops an idle link, and how long each session lasted — the
+# key signals for diagnosing the "AA disconnects after minimize" behaviour.
+
+/unexpected transfer stall/ {
+    printf "%s  [STALL]      unexpected transfer stall — proxy dropped the link\n", ts
+}
+
+/new client connected/ {
+    conn_count++
+    detail = $0
+    gsub(esc "\\[[0-9;]*m", "", detail)
+    sub(/.*new client connected: /, "", detail)
+    tag = (conn_count == 1) ? "[CONNECT]   " : "[RECONNECT] "
+    printf "%s  %s phone %s\n", ts, tag, detail
+}
+
+/session time:/ {
+    detail = $0
+    gsub(esc "\\[[0-9;]*m", "", detail)
+    sub(/.*session time: /, "", detail)
+    printf "%s  [SESSION]    ended after %s\n", ts, detail
 }
 
 # ── Touch events ───────────────────────────────────────────────────────────────
